@@ -276,6 +276,8 @@ fn testplans_section(qalam_dir: &std::path::Path, limit: usize, since_ts: Option
 }
 
 fn skills_section(qalam_dir: &std::path::Path) -> Option<String> {
+    use crate::commands::skill::read_skill_content;
+
     let skills_dir = qalam_dir.join("skills");
     if !skills_dir.exists() { return None; }
 
@@ -288,8 +290,7 @@ fn skills_section(qalam_dir: &std::path::Path) -> Option<String> {
 
     let mut block = String::new();
     for entry in &entries {
-        let ctx_path = entry.path().join("context.md");
-        if let Ok(content) = std::fs::read_to_string(&ctx_path) {
+        if let Some(content) = read_skill_content(&entry.path()) {
             block.push_str(&content);
             block.push('\n');
         }

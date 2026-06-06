@@ -2,51 +2,51 @@ use clap::Subcommand;
 use std::env;
 use crate::config::QALAM_DIR;
 
-/// Registry base: GitHub repo that hosts community skills.
-/// Structure: galihsatriawan/qalam-skills/skills/<name>/{skill.yaml,context.md}
+/// Primary registry: skills.sh ecosystem (any GitHub repo with SKILL.md files).
+/// Extended registry: galihsatriawan/qalam-skills (qalam-specific skills).
+/// Install formats:
+///   @name          → galihsatriawan/qalam-skills/skills/<name>/SKILL.md
+///   owner/repo     → skills.sh-compatible GitHub repo (delegates to npx skills, or raw fetch)
+///   https://...    → direct SKILL.md URL
+///   ./path         → local directory copy
 const REGISTRY_REPO: &str = "galihsatriawan/qalam-skills";
 const REGISTRY_BRANCH: &str = "main";
 
 #[derive(Subcommand)]
 pub enum Action {
-    /// Install a skill (local path, @scope/name from registry, or built-in scaffold)
+    /// Install a skill.
+    /// @name → from qalam-skills registry.
+    /// owner/repo → any skills.sh-compatible GitHub repo.
+    /// ./path → local directory.
     Install {
-        /// Skill name, @scope/name, or local path (./my-skill)
         name: String,
     },
     /// List installed skills
     List,
     /// Remove an installed skill
     Remove {
-        /// Skill name to remove
         name: String,
     },
-    /// List available skills in the registry
+    /// Search for skills. Delegates to skills.sh for community search; shows qalam-skills registry without a query.
     Search {
-        /// Optional filter
         query: Option<String>,
     },
-    /// Publish a local skill to the registry (opens a GitHub issue)
+    /// Publish a local skill to qalam-skills registry (opens a PR)
     Publish {
-        /// Skill name to publish
         name: String,
     },
-    /// Expose a skill as a Claude Code slash command (.claude/commands/)
+    /// Expose a skill as a Claude Code slash command (.claude/commands/<name>.md)
     Expose {
-        /// Skill name to expose; use --all to expose all skills
         name: Option<String>,
-        /// Expose all installed skills
         #[arg(long)]
         all: bool,
     },
-    /// Update an installed registry skill to the latest version
+    /// Update an installed skill to the latest registry version
     Update {
-        /// Skill name to update (omit to update all)
         name: Option<String>,
     },
     /// Show diff between installed skill and registry version
     Diff {
-        /// Skill name to diff
         name: String,
     },
 }
@@ -74,12 +74,22 @@ async fn install(name: &str) -> anyhow::Result<()> {
         return install_local(name, &skills_dir);
     }
 
-    // Registry: @scope/name or just name with @ prefix
-    if name.starts_with('@') {
-        return install_from_registry(name, &skills_dir).await;
+    // Direct HTTPS URL
+    if name.starts_with("https://") {
+        return install_from_url(name, &skills_dir).await;
     }
 
-    // No prefix — scaffold built-in
+    // @name → qalam-skills registry
+    if name.starts_with('@') {
+        return install_from_qalam_registry(name, &skills_dir).await;
+    }
+
+    // owner/repo → skills.sh-compatible GitHub repo
+    if name.contains('/') {
+        return install_from_skills_sh(name, &skills_dir).await;
+    }
+
+    // No prefix — scaffold new skill with SKILL.md template
     install_scaffold(name, &skills_dir)
 }
 
@@ -95,44 +105,93 @@ fn install_local(path: &str, skills_dir: &std::path::Path) -> anyhow::Result<()>
     Ok(())
 }
 
-async fn install_from_registry(name: &str, skills_dir: &std::path::Path) -> anyhow::Result<()> {
-    // @scope/skill-name → use scope as registry owner, skill-name as skill
-    // @skill-name → use default registry
+/// Install from a skills.sh-compatible GitHub repo (owner/repo format).
+/// Delegates to `npx skills add` if available, otherwise falls back to raw GitHub fetch.
+async fn install_from_skills_sh(repo: &str, skills_dir: &std::path::Path) -> anyhow::Result<()> {
+    // Try npx skills first (preserves skills.sh agent directory routing)
+    let npx = std::process::Command::new("npx")
+        .args(["--yes", "skills", "add", repo, "--all", "--yes"])
+        .status();
+
+    match npx {
+        Ok(s) if s.success() => {
+            println!("✓ Installed via skills.sh CLI — run `qalam skill list` to see installed skills.");
+            println!("  Tip: also copy SKILL.md into .qalam/skills/<name>/ to make it available to qalam context.");
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // Fallback: fetch root SKILL.md from the GitHub repo
+    println!("npx skills not available — fetching SKILL.md directly from {repo}...");
+    let parts: Vec<&str> = repo.splitn(2, '/').collect();
+    anyhow::ensure!(parts.len() == 2, "Expected owner/repo format, got: {}", repo);
+    let (owner, repo_name) = (parts[0], parts[1]);
+    let local_name = repo_name.trim_end_matches("-skills");
+
+    let url = format!(
+        "https://raw.githubusercontent.com/{owner}/{repo_name}/main/SKILL.md"
+    );
+    let content = fetch_raw_text(&url).await
+        .map_err(|_| anyhow::anyhow!("Could not fetch SKILL.md from {url}\nCheck that the repo exists and has a SKILL.md at the root."))?;
+
+    let dest = skills_dir.join(local_name);
+    std::fs::create_dir_all(&dest)?;
+    std::fs::write(dest.join("SKILL.md"), content)?;
+    println!("✓ Installed skill '{}' from {}", local_name, repo);
+    Ok(())
+}
+
+/// Install from a direct HTTPS URL pointing to a SKILL.md file.
+async fn install_from_url(url: &str, skills_dir: &std::path::Path) -> anyhow::Result<()> {
+    let content = fetch_raw_text(url).await
+        .map_err(|e| anyhow::anyhow!("Failed to fetch {url}: {e}"))?;
+
+    // Derive name from URL path
+    let name = url.split('/').rev()
+        .find(|s| !s.is_empty() && *s != "SKILL.md")
+        .unwrap_or("custom-skill");
+
+    let dest = skills_dir.join(name);
+    std::fs::create_dir_all(&dest)?;
+    std::fs::write(dest.join("SKILL.md"), content)?;
+    println!("✓ Installed skill '{}' from URL", name);
+    Ok(())
+}
+
+async fn install_from_qalam_registry(name: &str, skills_dir: &std::path::Path) -> anyhow::Result<()> {
     let clean = name.trim_start_matches('@');
     let (registry_path, local_name) = if let Some((scope, skill)) = clean.split_once('/') {
-        // @scope/skill → try scope as a github org: scope/qalam-skills
-        let repo = format!("{}/qalam-skills", scope);
-        (format!("{}/skills/{}", repo, skill), skill.to_string())
+        (format!("{scope}/qalam-skills/skills/{skill}"), skill.to_string())
     } else {
-        (format!("{}/skills/{}", REGISTRY_REPO, clean), clean.to_string())
+        (format!("{REGISTRY_REPO}/skills/{clean}"), clean.to_string())
     };
 
     let dest = skills_dir.join(&local_name);
-    anyhow::ensure!(!dest.exists(), "Skill '{}' is already installed", local_name);
+    anyhow::ensure!(!dest.exists(), "Skill '{}' is already installed. Use: qalam skill update {}", local_name, local_name);
 
-    println!("Fetching {} from registry...", name);
-
-    let files = fetch_registry_skill(&registry_path).await?;
+    println!("Fetching {} from qalam-skills registry...", name);
+    let files = fetch_skill_files(&registry_path).await?;
     std::fs::create_dir_all(&dest)?;
 
     for (filename, content) in &files {
         std::fs::write(dest.join(filename), content)?;
     }
 
-    println!("✓ Installed skill '{}' from registry", local_name);
+    println!("✓ Installed skill '{}' from qalam-skills registry", local_name);
     Ok(())
 }
 
 fn install_scaffold(name: &str, skills_dir: &std::path::Path) -> anyhow::Result<()> {
     let dest = skills_dir.join(name);
-    anyhow::ensure!(!dest.exists(), "Skill '{}' is already installed", name);
+    anyhow::ensure!(!dest.exists(), "Skill '{}' already exists", name);
 
     std::fs::create_dir_all(&dest)?;
-    std::fs::write(dest.join("skill.yaml"), skill_manifest(name))?;
-    std::fs::write(dest.join("context.md"), skill_context(name))?;
+    std::fs::write(dest.join("SKILL.md"), skill_template(name))?;
 
     println!("✓ Scaffolded skill '{}' in .qalam/skills/{}/", name, name);
-    println!("  Edit .qalam/skills/{}/context.md to add your patterns.", name);
+    println!("  Edit .qalam/skills/{}/SKILL.md to add your patterns.", name);
+    println!("  Tip: this format is compatible with skills.sh — you can publish via npx skills or qalam skill publish.");
     Ok(())
 }
 
@@ -141,7 +200,10 @@ async fn list() -> anyhow::Result<()> {
     let skills_dir = root.join(QALAM_DIR).join("skills");
 
     if !skills_dir.exists() {
-        println!("No skills installed. Run: qalam skill install <name>");
+        println!("No skills installed.");
+        println!("  From qalam-skills registry: qalam skill install @golang");
+        println!("  From skills.sh ecosystem:   qalam skill install owner/repo");
+        println!("  Scaffold new:               qalam skill install my-skill");
         return Ok(());
     }
 
@@ -152,14 +214,13 @@ async fn list() -> anyhow::Result<()> {
     entries.sort_by_key(|e| e.file_name());
 
     if entries.is_empty() {
-        println!("No skills installed. Run: qalam skill install <name>");
+        println!("No skills installed.");
         return Ok(());
     }
 
     for entry in &entries {
         let name = entry.file_name().to_string_lossy().to_string();
-        let desc = read_skill_description(&entry.path().join("skill.yaml"))
-            .unwrap_or_default();
+        let desc = read_skill_description(&entry.path()).unwrap_or_default();
         if desc.is_empty() {
             println!("  {}", name);
         } else {
@@ -179,72 +240,73 @@ async fn remove(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Search for skills.
+/// - With a query: delegates to `npx skills find` (skills.sh ecosystem).
+/// - Without a query: lists available skills in the qalam-skills registry.
 async fn search(query: Option<&str>) -> anyhow::Result<()> {
-    println!("Fetching registry index from {}...", REGISTRY_REPO);
+    if let Some(q) = query {
+        // Delegate to skills.sh CLI for community search
+        println!("Searching skills.sh for '{q}'...\n");
+        let status = std::process::Command::new("npx")
+            .args(["--yes", "skills", "find", q])
+            .status();
+
+        match status {
+            Ok(s) if s.success() => return Ok(()),
+            _ => {
+                println!("  npx skills not available. Browse skills.sh manually: https://www.skills.sh/");
+                println!("  Install CLI: npm install -g skills\n");
+            }
+        }
+    }
+
+    // Always also show qalam-skills registry
+    println!("Available skills in qalam-skills registry (install with: qalam skill install @<name>):");
     let url = format!(
-        "https://api.github.com/repos/{}/contents/skills?ref={}",
-        REGISTRY_REPO, REGISTRY_BRANCH
+        "https://api.github.com/repos/{REGISTRY_REPO}/contents/skills?ref={REGISTRY_BRANCH}"
     );
 
-    let client = reqwest::Client::builder()
-        .user_agent("qalam-cli")
-        .build()?;
-
-    let resp = client.get(&url).send().await;
-
-    match resp {
+    let client = http_client()?;
+    match client.get(&url).send().await {
         Ok(r) if r.status().is_success() => {
             let items: Vec<serde_json::Value> = r.json().await?;
             let skills: Vec<_> = items.iter()
                 .filter(|item| item["type"] == "dir")
                 .filter_map(|item| item["name"].as_str())
-                .filter(|name| {
-                    query.map(|q| name.contains(q)).unwrap_or(true)
-                })
+                .filter(|name| query.map(|q| name.contains(q)).unwrap_or(true))
                 .collect();
 
             if skills.is_empty() {
-                println!("No skills found in registry.");
+                println!("  No matching skills found.");
             } else {
-                println!("Available skills (install with: qalam skill install @<name>):");
                 for skill in skills {
-                    println!("  @{}", skill);
+                    println!("  @{skill}");
                 }
             }
         }
         _ => {
-            println!("Registry not reachable. Available built-in scaffolds:");
-            for name in &["rust", "go", "node", "python", "java", "kotlin", "grpc", "docker"] {
-                println!("  {}", name);
-            }
-            println!("\nInstall with: qalam skill install <name>");
+            println!("  Registry not reachable. Skills available: golang, rust, python, nodejs, kotlin, java, grpc, rest-api, gin, fiber, fastapi, nestjs, spring-boot, clean-arch, hexagonal, cqrs, event-sourcing, ddd, payment, auth, notification, ecommerce");
         }
     }
 
     Ok(())
 }
 
-/// Fetch skill files from GitHub raw content.
-async fn fetch_registry_skill(registry_path: &str) -> anyhow::Result<Vec<(String, String)>> {
+/// Fetch all files from a GitHub directory (via GitHub API).
+async fn fetch_skill_files(registry_path: &str) -> anyhow::Result<Vec<(String, String)>> {
     let parts: Vec<&str> = registry_path.splitn(3, '/').collect();
     anyhow::ensure!(parts.len() == 3, "Invalid registry path: {}", registry_path);
-    let owner = parts[0];
-    let repo = parts[1];
-    let path = parts[2];
+    let (owner, repo, path) = (parts[0], parts[1], parts[2]);
 
     let api_url = format!(
-        "https://api.github.com/repos/{}/{}/contents/{}?ref={}",
-        owner, repo, path, REGISTRY_BRANCH
+        "https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={REGISTRY_BRANCH}"
     );
 
-    let client = reqwest::Client::builder()
-        .user_agent("qalam-cli")
-        .build()?;
-
+    let client = http_client()?;
     let resp = client.get(&api_url).send().await?;
     anyhow::ensure!(
         resp.status().is_success(),
-        "Skill not found in registry (HTTP {}). Check: qalam skill search",
+        "Skill not found in registry (HTTP {}). Run: qalam skill search",
         resp.status()
     );
 
@@ -252,76 +314,136 @@ async fn fetch_registry_skill(registry_path: &str) -> anyhow::Result<Vec<(String
     let mut files = Vec::new();
 
     for item in &items {
-        if item["type"] != "file" {
-            continue;
-        }
+        if item["type"] != "file" { continue; }
         let filename = item["name"].as_str().unwrap_or("").to_string();
+        // Only fetch SKILL.md; skip unrelated files
+        if filename != "SKILL.md" { continue; }
         let download_url = item["download_url"].as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing download_url for {}", filename))?;
-
-        let content = client.get(download_url).send().await?.text().await?;
+        let content = fetch_raw_text(download_url).await?;
         files.push((filename, content));
     }
 
-    anyhow::ensure!(!files.is_empty(), "No files found for skill at {}", registry_path);
+    anyhow::ensure!(!files.is_empty(), "No SKILL.md found for skill at {}", registry_path);
     Ok(files)
 }
 
-fn skill_manifest(name: &str) -> String {
-    format!("name: {}\ndescription: \"\"\nversion: \"0.1.0\"\nauthor: \"\"\n", name)
+async fn fetch_raw_text(url: &str) -> anyhow::Result<String> {
+    let client = http_client()?;
+    Ok(client.get(url).send().await?.text().await?)
 }
 
-fn skill_context(name: &str) -> String {
+fn http_client() -> anyhow::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder().user_agent("qalam-cli").build()?)
+}
+
+fn skill_template(name: &str) -> String {
     format!(
-        "# Skill: {name}\n\
+        "---\n\
+        name: {name}\n\
+        description: \"\"\n\
+        category: lang\n\
+        tags: []\n\
+        version: 0.1.0\n\
+        ---\n\
+        \n\
+        # {name}\n\
         \n\
         ## Overview\n\
         <!-- Describe what this skill provides -->\n\
         \n\
-        ## Code Patterns\n\
+        ## Patterns & Conventions\n\
         <!-- Patterns and conventions specific to this skill/tech stack -->\n\
         \n\
-        ## Agent Instructions\n\
-        <!-- How AI agents should behave when working with this skill -->\n\
+        ## Code Examples\n\
+        <!-- Representative code examples -->\n\
         \n\
-        ## Examples\n\
-        <!-- Representative code examples -->\n"
+        ## Agent Instructions\n\
+        <!-- How AI agents should behave when working in this context -->\n"
     )
 }
 
-fn read_skill_description(manifest_path: &std::path::Path) -> anyhow::Result<String> {
-    let content = std::fs::read_to_string(manifest_path)?;
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("description:") {
-            let desc = rest.trim().trim_matches('"');
-            if !desc.is_empty() {
-                return Ok(desc.to_string());
-            }
+/// Read skill description from SKILL.md frontmatter, falling back to legacy skill.yaml.
+fn read_skill_description(skill_dir: &std::path::Path) -> anyhow::Result<String> {
+    // Primary: SKILL.md frontmatter
+    let skill_md = skill_dir.join("SKILL.md");
+    if skill_md.exists() {
+        let content = std::fs::read_to_string(&skill_md)?;
+        if let Some(desc) = parse_frontmatter_field(&content, "description") {
+            return Ok(desc);
+        }
+    }
+    // Fallback: legacy skill.yaml
+    let skill_yaml = skill_dir.join("skill.yaml");
+    if skill_yaml.exists() {
+        let content = std::fs::read_to_string(&skill_yaml)?;
+        if let Some(desc) = parse_frontmatter_field(&content, "description") {
+            return Ok(desc);
         }
     }
     Ok(String::new())
 }
 
+fn parse_frontmatter_field(content: &str, field: &str) -> Option<String> {
+    // Works for both YAML frontmatter (--- ... ---) and plain YAML files
+    let body = if content.starts_with("---") {
+        content.splitn(3, "---").nth(1).unwrap_or(content)
+    } else {
+        content
+    };
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix(&format!("{field}:")) {
+            let val = rest.trim().trim_matches('"').trim_matches('\'');
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Read SKILL.md content, stripping frontmatter for context injection.
+pub fn read_skill_content(skill_dir: &std::path::Path) -> Option<String> {
+    // Primary: SKILL.md
+    let skill_md = skill_dir.join("SKILL.md");
+    if skill_md.exists() {
+        let raw = std::fs::read_to_string(&skill_md).ok()?;
+        return Some(strip_frontmatter(&raw));
+    }
+    // Fallback: legacy context.md
+    let ctx = skill_dir.join("context.md");
+    if ctx.exists() {
+        return std::fs::read_to_string(&ctx).ok();
+    }
+    None
+}
+
+fn strip_frontmatter(content: &str) -> String {
+    if !content.starts_with("---") {
+        return content.to_string();
+    }
+    // Split on second "---\n"
+    if let Some(rest) = content[3..].find("\n---") {
+        return content[3 + rest + 4..].to_string();
+    }
+    content.to_string()
+}
+
 async fn publish(name: &str) -> anyhow::Result<()> {
     let root = env::current_dir()?;
     let skill_dir = root.join(QALAM_DIR).join("skills").join(name);
-    anyhow::ensure!(skill_dir.exists(), "Skill '{}' is not installed. Run: qalam skill list", name);
+    anyhow::ensure!(skill_dir.exists(), "Skill '{}' not found. Run: qalam skill list", name);
 
-    let context = std::fs::read_to_string(skill_dir.join("context.md"))
-        .unwrap_or_else(|_| "<!-- no context.md found -->".to_string());
-    let manifest = std::fs::read_to_string(skill_dir.join("skill.yaml"))
-        .unwrap_or_else(|_| format!("name: {name}\n"));
+    let skill_md_path = skill_dir.join("SKILL.md");
+    anyhow::ensure!(skill_md_path.exists(), "No SKILL.md found in skill '{}'. Run: qalam skill install {}", name, name);
+    let skill_content = std::fs::read_to_string(&skill_md_path)?;
 
     let token = std::env::var("GITHUB_TOKEN")
         .map_err(|_| anyhow::anyhow!("GITHUB_TOKEN not set. Set GITHUB_TOKEN to publish."))?;
 
-    let client = reqwest::Client::builder()
-        .user_agent("qalam-cli")
-        .build()?;
-
+    let client = http_client()?;
     let (reg_owner, reg_repo) = REGISTRY_REPO.split_once('/').unwrap();
 
-    // 1. Get authenticated user login
     let user: serde_json::Value = client
         .get("https://api.github.com/user")
         .bearer_auth(&token)
@@ -331,7 +453,6 @@ async fn publish(name: &str) -> anyhow::Result<()> {
         .to_string();
     println!("Logged in as: {login}");
 
-    // 2. Fork registry (idempotent)
     println!("Forking {REGISTRY_REPO}...");
     client
         .post(format!("https://api.github.com/repos/{reg_owner}/{reg_repo}/forks"))
@@ -339,71 +460,61 @@ async fn publish(name: &str) -> anyhow::Result<()> {
         .json(&serde_json::json!({}))
         .send().await?;
 
-    // Give GitHub a moment to create the fork
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-    // 3. Get default branch SHA
     let branch_info: serde_json::Value = client
         .get(format!("https://api.github.com/repos/{login}/{reg_repo}/git/ref/heads/{REGISTRY_BRANCH}"))
         .bearer_auth(&token)
         .send().await?.json().await?;
     let base_sha = branch_info["object"]["sha"].as_str()
-        .ok_or_else(|| anyhow::anyhow!("Could not get base branch SHA from fork"))?
+        .ok_or_else(|| anyhow::anyhow!("Could not get base branch SHA"))?
         .to_string();
 
-    // 4. Create feature branch
     let branch = format!("skill/{name}");
-    let create_branch = client
+    let r = client
         .post(format!("https://api.github.com/repos/{login}/{reg_repo}/git/refs"))
         .bearer_auth(&token)
-        .json(&serde_json::json!({
-            "ref": format!("refs/heads/{branch}"),
-            "sha": base_sha
-        }))
+        .json(&serde_json::json!({ "ref": format!("refs/heads/{branch}"), "sha": base_sha }))
         .send().await?;
-    // 422 = branch already exists, that's fine
     anyhow::ensure!(
-        create_branch.status().is_success() || create_branch.status().as_u16() == 422,
-        "Failed to create branch: {}",
-        create_branch.text().await.unwrap_or_default()
+        r.status().is_success() || r.status().as_u16() == 422,
+        "Failed to create branch: {}", r.text().await.unwrap_or_default()
     );
     println!("Branch: {branch}");
 
-    // 5. Commit skill.yaml and context.md
-    for (filename, content) in &[("skill.yaml", &manifest), ("context.md", &context)] {
-        let path = format!("skills/{name}/{filename}");
-        // Check if file exists (need SHA to update)
-        let existing: serde_json::Value = client
-            .get(format!("https://api.github.com/repos/{login}/{reg_repo}/contents/{path}?ref={branch}"))
-            .bearer_auth(&token)
-            .send().await?.json().await?;
-        let existing_sha = existing["sha"].as_str().map(|s| s.to_string());
+    // Commit SKILL.md
+    let file_path = format!("skills/{name}/SKILL.md");
+    let existing: serde_json::Value = client
+        .get(format!("https://api.github.com/repos/{login}/{reg_repo}/contents/{file_path}?ref={branch}"))
+        .bearer_auth(&token)
+        .send().await?.json().await?;
+    let existing_sha = existing["sha"].as_str().map(|s| s.to_string());
 
-        use base64::Engine;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
-        let mut payload = serde_json::json!({
-            "message": format!("Add skill: {name}"),
-            "content": encoded,
-            "branch": branch
-        });
-        if let Some(sha) = existing_sha {
-            payload["sha"] = serde_json::Value::String(sha);
-        }
-
-        let resp = client
-            .put(format!("https://api.github.com/repos/{login}/{reg_repo}/contents/{path}"))
-            .bearer_auth(&token)
-            .json(&payload)
-            .send().await?;
-        anyhow::ensure!(
-            resp.status().is_success(),
-            "Failed to commit {filename}: {}",
-            resp.text().await.unwrap_or_default()
-        );
-        println!("  ✓ Committed {filename}");
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(skill_content.as_bytes());
+    let mut payload = serde_json::json!({
+        "message": format!("Add skill: {name}"),
+        "content": encoded,
+        "branch": branch
+    });
+    if let Some(sha) = existing_sha {
+        payload["sha"] = serde_json::Value::String(sha);
     }
 
-    // 6. Open PR against registry
+    let resp = client
+        .put(format!("https://api.github.com/repos/{login}/{reg_repo}/contents/{file_path}"))
+        .bearer_auth(&token)
+        .json(&payload)
+        .send().await?;
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "Failed to commit SKILL.md: {}", resp.text().await.unwrap_or_default()
+    );
+    println!("  ✓ Committed SKILL.md");
+
+    let desc = parse_frontmatter_field(&std::fs::read_to_string(&skill_md_path)?, "description")
+        .unwrap_or_default();
+
     let pr_resp = client
         .post(format!("https://api.github.com/repos/{reg_owner}/{reg_repo}/pulls"))
         .bearer_auth(&token)
@@ -412,21 +523,19 @@ async fn publish(name: &str) -> anyhow::Result<()> {
             "head": format!("{login}:{branch}"),
             "base": REGISTRY_BRANCH,
             "body": format!(
-                "## New Skill: `{name}`\n\nSubmitted via `qalam skill publish`.\n\n### skill.yaml\n\n```yaml\n{manifest}\n```\n\n### context.md\n\n{context}"
+                "## New Skill: `{name}`\n\n**Description:** {desc}\n\nSubmitted via `qalam skill publish`.\n\nThis skill is compatible with the [skills.sh](https://www.skills.sh) ecosystem.\n\n<details><summary>SKILL.md preview</summary>\n\n{skill_content}\n\n</details>"
             )
         }))
         .send().await?;
 
     anyhow::ensure!(
         pr_resp.status().is_success(),
-        "Failed to open PR: {}",
-        pr_resp.text().await.unwrap_or_default()
+        "Failed to open PR: {}", pr_resp.text().await.unwrap_or_default()
     );
 
     let pr: serde_json::Value = pr_resp.json().await?;
     let pr_url = pr["html_url"].as_str().unwrap_or("(unknown)");
     println!("\n✓ PR opened: {pr_url}");
-
     Ok(())
 }
 
@@ -447,24 +556,22 @@ async fn expose(name: Option<&str>, all: bool) -> anyhow::Result<()> {
     };
 
     if names.is_empty() {
-        println!("No skills installed. Run: qalam skill install <name>");
+        println!("No skills installed. Run: qalam skill install @golang");
         return Ok(());
     }
 
     for skill_name in &names {
-        let ctx_path = skills_dir.join(skill_name).join("context.md");
-        let content = std::fs::read_to_string(&ctx_path)
-            .unwrap_or_else(|_| format!("# {skill_name} patterns\n\n(no context.md found)"));
+        let skill_dir = skills_dir.join(skill_name);
+        let content = read_skill_content(&skill_dir)
+            .unwrap_or_else(|| format!("# {skill_name}\n\n(no SKILL.md found)"));
 
         let command_file = commands_dir.join(format!("{skill_name}.md"));
+        // Keep the Claude command header minimal so the skill content reads naturally
         let command_content = format!(
-            "# qalam skill: {skill_name}\n\n\
-            Apply the {skill_name} patterns and conventions from this project's qalam skill.\n\n\
-            {content}"
+            "Apply the {skill_name} patterns and conventions from this project's qalam skill:\n\n{content}"
         );
         std::fs::write(&command_file, command_content)?;
-        println!("✓ Exposed skill '{skill_name}' as /{skill_name}");
-        println!("  Location: .claude/commands/{skill_name}.md");
+        println!("✓ Exposed '/{skill_name}' → .claude/commands/{skill_name}.md");
     }
     Ok(())
 }
@@ -484,9 +591,9 @@ async fn update(name: Option<&str>) -> anyhow::Result<()> {
     };
 
     for skill_name in &names {
-        let registry_path = format!("{}/skills/{}", REGISTRY_REPO, skill_name);
+        let registry_path = format!("{REGISTRY_REPO}/skills/{skill_name}");
         print!("Updating {skill_name}... ");
-        match fetch_registry_skill(&registry_path).await {
+        match fetch_skill_files(&registry_path).await {
             Ok(files) => {
                 let dest = skills_dir.join(skill_name);
                 for (filename, content) in &files {
@@ -505,9 +612,9 @@ async fn diff(name: &str) -> anyhow::Result<()> {
     let skill_dir = root.join(QALAM_DIR).join("skills").join(name);
     anyhow::ensure!(skill_dir.exists(), "Skill '{}' not installed", name);
 
-    let registry_path = format!("{}/skills/{}", REGISTRY_REPO, name);
+    let registry_path = format!("{REGISTRY_REPO}/skills/{name}");
     println!("Fetching registry version of '{name}'...");
-    let files = match fetch_registry_skill(&registry_path).await {
+    let files = match fetch_skill_files(&registry_path).await {
         Ok(f) => f,
         Err(_) => {
             println!("  Skill '{name}' not found in registry (may be local-only).");
@@ -522,7 +629,6 @@ async fn diff(name: &str) -> anyhow::Result<()> {
         if &local_content != remote_content {
             println!("--- installed/{name}/{filename}");
             println!("+++ registry/{name}/{filename}");
-            // Simple line diff
             for diff_line in simple_diff(&local_content, remote_content) {
                 println!("{diff_line}");
             }
@@ -543,10 +649,7 @@ fn simple_diff(a: &str, b: &str) -> Vec<String> {
     for i in 0..max {
         match (a_lines.get(i), b_lines.get(i)) {
             (Some(l), Some(r)) if l == r => {}
-            (Some(l), Some(r)) => {
-                out.push(format!("-{l}"));
-                out.push(format!("+{r}"));
-            }
+            (Some(l), Some(r)) => { out.push(format!("-{l}")); out.push(format!("+{r}")); }
             (Some(l), None) => out.push(format!("-{l}")),
             (None, Some(r)) => out.push(format!("+{r}")),
             _ => {}
